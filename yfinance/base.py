@@ -43,13 +43,134 @@ from .scrapers.quote import Quote, FastInfo
 from .scrapers.history import PriceHistory
 from .scrapers.funds import FundsData
 
-from .const import _BASE_URL_, _ROOT_URL_, _QUERY1_URL_
+from .const import _BASE_URL_, _QUERY1_URL_, _NEWS_URL_
 
 from io import StringIO
 from bs4 import BeautifulSoup
 
 
 _tz_info_fetch_ctr = 0
+
+# List slugs from the quote page config (listAliases). Same three tabs as before.
+_NEWS_LIST_ALIASES = {
+    "all": "finance-US-en-US-ticker-all",
+    "news": "finance-US-en-US-ticker-news",
+    "press releases": "finance-US-en-US-ticker-pressrelease",
+}
+
+# Rank weights copied from the quote page's financeQuoteNewsV2 config.
+_NEWS_RANK = {
+    "boostDurationHours": 16,
+    "aboutnessWeight": 0.05,
+    "recencyWeight": 1,
+    "halfLifeHours": 24,
+}
+
+_NEWS_QUERY = """
+query FinancePolarisTickerListNews(
+  $listInput: LightyearListInput!
+  $clientContext: ClientContext!
+  $mlRecsInput: MLRecsInput!
+  $gqlContext: [GqlContext!]
+  $mlRecsFirst: Int
+) {
+  financeTickerList(list_input: $listInput, cc: $clientContext) {
+    mlRecsStream(mlRecsInput: $mlRecsInput, first: $mlRecsFirst) {
+      edges {
+        node {
+          asset(gqlContext: $gqlContext) {
+            __typename
+            ... on Story {
+              uuid
+              title
+              contentAttributes {
+                summary
+                publishTime
+                canonicalUrl
+                clickthroughUrl(cc: $clientContext)
+                provider { displayName url }
+              }
+              finance { stockTickers { symbol } }
+            }
+            ... on Outlink {
+              uuid
+              headline
+              description
+              url
+              displayTime
+              provider { displayName url }
+            }
+            ... on Video {
+              uuid
+              title
+              contentAttributes {
+                summary
+                publishTime
+                canonicalUrl
+                provider { displayName }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+_NEWS_HEADERS = {"x-yahoo-cg-client-name": "finance"}
+
+
+def _link_field(value):
+    if isinstance(value, str) and value:
+        return {"url": value}
+    if isinstance(value, dict) and value.get("url"):
+        return value
+    return None
+
+
+def _article_from_asset(asset):
+    """Map a Content Gateway asset onto the stream item get_news() used to return."""
+    if not isinstance(asset, dict):
+        return None
+    kind = asset.get("__typename") or ""
+    if kind in ("", "AssetError"):
+        return None
+    attrs = asset.get("contentAttributes") if isinstance(asset.get("contentAttributes"), dict) else {}
+    provider = attrs.get("provider") or asset.get("provider") or {}
+    content = {
+        "id": asset.get("uuid"),
+        "contentType": kind.upper(),
+        "title": asset.get("title") or asset.get("headline"),
+        "summary": attrs.get("summary") or attrs.get("description") or asset.get("description"),
+        "pubDate": attrs.get("publishTime") or attrs.get("displayTime") or asset.get("displayTime"),
+        "provider": provider if isinstance(provider, dict) else {},
+    }
+    canonical = _link_field(attrs.get("canonicalUrl") or asset.get("url"))
+    link = _link_field(attrs.get("clickthroughUrl") or attrs.get("canonicalUrl") or asset.get("url"))
+    if canonical:
+        content["canonicalUrl"] = canonical
+    if link:
+        content["clickThroughUrl"] = link
+    tickers = (asset.get("finance") or {}).get("stockTickers") if isinstance(asset.get("finance"), dict) else None
+    if tickers:
+        content["finance"] = {"stockTickers": tickers}
+    return {"id": asset.get("uuid"), "content": content}
+
+
+def _articles_from_news_payload(data):
+    if not isinstance(data, dict):
+        return []
+    ticker_list = (data.get("data") or {}).get("financeTickerList") or {}
+    stream = ticker_list.get("mlRecsStream") or {}
+    articles = []
+    for edge in stream.get("edges") or []:
+        asset = ((edge or {}).get("node") or {}).get("asset")
+        article = _article_from_asset(asset)
+        if article is not None and not article.get("ad"):
+            articles.append(article)
+    return articles
+
 
 class TickerBase:
     def __init__(self, ticker, session=None):
@@ -616,33 +737,53 @@ class TickerBase:
         """Allowed options for tab: "news", "all", "press releases"""
         logger = utils.get_yf_logger()
 
-
-        tab_queryrefs = {
-            "all": "newsAll",
-            "news": "latestNews",
-            "press releases": "pressRelease",
-        }
-
-        query_ref = tab_queryrefs.get(tab.lower())
-        if not query_ref:
-            raise ValueError(f"Invalid tab name '{tab}'. Choose from: {', '.join(tab_queryrefs.keys())}")
+        list_alias = _NEWS_LIST_ALIASES.get(tab.lower())
+        if not list_alias:
+            raise ValueError(f"Invalid tab name '{tab}'. Choose from: {', '.join(_NEWS_LIST_ALIASES.keys())}")
 
         # Cache per request: a different count or tab is a different result
-        cache_key = (count, query_ref)
+        cache_key = (count, list_alias)
         if self._news.get(cache_key):
             return self._news[cache_key]
 
-        url = f"{_ROOT_URL_}/xhr/ncp?queryRef={query_ref}&serviceKey=ncp_fin"
+        symbol = self.ticker.upper()
+        slug = f"list={list_alias}"
         payload = {
-            "serviceConfig": {
-                "snippetCount": count,
-                "s": [self.ticker]
-            }
+            "operationName": "FinancePolarisTickerListNews",
+            "query": _NEWS_QUERY,
+            "variables": {
+                "clientContext": {
+                    "device": "desktop",
+                    "region": "US",
+                    "site": "finance",
+                    "lang": "en-US",
+                },
+                "gqlContext": [{"listAlias": slug}],
+                "listInput": {
+                    "filterClientContext": False,
+                    "getFullList": True,
+                    "enableQueryTimeLicenseCheck": True,
+                    "queryVariables": {"tickerSymbol": [symbol]},
+                    "slug": slug,
+                },
+                "mlRecsInput": {
+                    "count": max(count, 10),
+                    "instance": "FINANCE",
+                    "rankInput": {
+                        "financeQuoteNewsV2": {**_NEWS_RANK, "tickerSymbol": [symbol]},
+                    },
+                },
+                "mlRecsFirst": count,
+            },
         }
 
-        data = self._data.post(url, body=payload)
+        data = self._data.post(_NEWS_URL_, body=payload, headers=_NEWS_HEADERS)
         if data is None or "Will be right back" in data.text:
             raise YFDataException("*** YAHOO! FINANCE IS CURRENTLY DOWN! ***")
+        if data.status_code == 404:
+            # A 404 used to parse as JSON with no stream and come back as [].
+            logger.warning(f"{self.ticker}: Yahoo news endpoint returned HTTP 404")
+            raise YFDataException(f"{self.ticker}: Yahoo news endpoint returned HTTP 404")
         try:
             data = data.json()
         except _json.JSONDecodeError:
@@ -651,9 +792,12 @@ class TickerBase:
             logger.error(f"{self.ticker}: Failed to retrieve the news and received faulty response instead.")
             data = {}
 
-        news = data.get("data", {}).get("tickerStream", {}).get("stream", [])
+        if isinstance(data, dict) and data.get("errors") and not (data.get("data") or {}).get("financeTickerList"):
+            message = data["errors"][0].get("message", "Yahoo news request failed")
+            logger.warning(f"{self.ticker}: {message}")
+            raise YFDataException(f"{self.ticker}: {message}")
 
-        self._news[cache_key] = [article for article in news if not article.get('ad', [])]
+        self._news[cache_key] = _articles_from_news_payload(data)
         return self._news[cache_key]
 
     def get_earnings_dates(self, limit = 12, offset = 0) -> Optional[pd.DataFrame]:

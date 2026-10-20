@@ -505,10 +505,26 @@ class TestTickerEarningsDatesParsing(unittest.TestCase):
 class TestTickerNews(unittest.TestCase):
     @staticmethod
     def _fake_post(url, body=None, **kwargs):
-        query_ref = url.split("queryRef=")[1].split("&")[0]
-        count = body["serviceConfig"]["snippetCount"]
-        stream = [{"id": f"{query_ref}-{i}"} for i in range(count)]
-        return MagicMock(text="", json=lambda: {"data": {"tickerStream": {"stream": stream}}})
+        variables = body["variables"]
+        alias = variables["listInput"]["slug"].split("list=", 1)[1]
+        count = variables["mlRecsFirst"]
+        edges = [{
+            "node": {"asset": {
+                "__typename": "Story",
+                "uuid": f"{alias}-{i}",
+                "title": f"title-{alias}-{i}",
+                "contentAttributes": {
+                    "summary": "summary",
+                    "publishTime": "2026-10-19T00:00:00Z",
+                    "canonicalUrl": "https://finance.yahoo.com/article",
+                    "clickthroughUrl": "https://finance.yahoo.com/article",
+                    "provider": {"displayName": "Yahoo Finance"},
+                },
+            }},
+        } for i in range(count)]
+        response = MagicMock(status_code=200, text="")
+        response.json.return_value = {"data": {"financeTickerList": {"mlRecsStream": {"edges": edges}}}}
+        return response
 
     def test_news_cached_per_count_and_tab(self):
         with patch("yfinance.data.YfData.post", side_effect=self._fake_post):
@@ -517,8 +533,12 @@ class TestTickerNews(unittest.TestCase):
             press = ticker.get_news(count=5, tab="press releases")
             news_again = ticker.get_news(count=2, tab="news")
 
-        self.assertEqual([a["id"] for a in news], ["latestNews-0", "latestNews-1"])
-        self.assertEqual([a["id"] for a in press], [f"pressRelease-{i}" for i in range(5)])
+        self.assertEqual([a["id"] for a in news], [
+            "finance-US-en-US-ticker-news-0", "finance-US-en-US-ticker-news-1"])
+        self.assertEqual(news[0]["content"]["title"], "title-finance-US-en-US-ticker-news-0")
+        self.assertEqual(news[0]["content"]["clickThroughUrl"]["url"], "https://finance.yahoo.com/article")
+        self.assertEqual([a["id"] for a in press], [
+            f"finance-US-en-US-ticker-pressrelease-{i}" for i in range(5)])
         self.assertIs(news_again, news, "data not cached")
 
     def test_news_invalid_tab_raises_after_cached_call(self):
@@ -527,6 +547,37 @@ class TestTickerNews(unittest.TestCase):
             ticker.get_news()
             with self.assertRaises(ValueError):
                 ticker.get_news(tab="bogus")
+
+    def test_news_404_warns_and_raises(self):
+        response = MagicMock(status_code=404, text='{"message":"Not Found"}')
+        with patch("yfinance.data.YfData.post", return_value=response):
+            with self.assertLogs("yfinance", level="WARNING") as logs:
+                with self.assertRaises(YFDataException):
+                    yf.Ticker("MSFT").get_news()
+        self.assertTrue(any("404" in message for message in logs.output))
+
+    def test_news_skips_unresolved_assets(self):
+        edges = [
+            {"node": {"asset": {"__typename": "AssetError"}}},
+            {"node": {"asset": {
+                "__typename": "Story",
+                "uuid": "u1",
+                "title": "Hello",
+                "contentAttributes": {
+                    "publishTime": "2026-10-19T00:00:00Z",
+                    "clickthroughUrl": "https://finance.yahoo.com/x",
+                    "provider": {"displayName": "Reuters"},
+                    "summary": "s",
+                },
+            }}},
+        ]
+        response = MagicMock(status_code=200, text="")
+        response.json.return_value = {"data": {"financeTickerList": {"mlRecsStream": {"edges": edges}}}}
+        with patch("yfinance.data.YfData.post", return_value=response):
+            news = yf.Ticker("MSFT").get_news()
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["content"]["title"], "Hello")
+        self.assertEqual(news[0]["content"]["provider"]["displayName"], "Reuters")
 
 class TestTickerHolders(unittest.TestCase):
     session = None
