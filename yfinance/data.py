@@ -414,11 +414,11 @@ class YfData(metaclass=SingletonMeta):
         return response
 
     @utils.log_indent_decorator
-    def post(self, url, body=None, params=None, timeout=30, data=None):
-        return self._make_request(url, request_method = self._session.post, body=body, params=params, timeout=timeout, data=data)
+    def post(self, url, body=None, params=None, timeout=30, data=None, headers=None):
+        return self._make_request(url, request_method = self._session.post, body=body, params=params, timeout=timeout, data=data, headers=headers)
 
     @utils.log_indent_decorator
-    def _make_request(self, url, request_method, body=None, params=None, timeout=30, data=None):
+    def _make_request(self, url, request_method, body=None, params=None, timeout=30, data=None, headers=None):
         # Important: treat input arguments as immutable.
 
         if len(url) > 200:
@@ -463,12 +463,15 @@ class YfData(metaclass=SingletonMeta):
             'timeout': timeout
         }
 
+        if headers:
+            request_args['headers'] = dict(headers)
+
         if body:
             request_args['json'] = body
         
         if data:
             request_args['data'] = data
-            request_args['headers'] = {"Content-Type": "application/json"}
+            request_args['headers'] = {**(request_args.get('headers') or {}), "Content-Type": "application/json"}
 
         for attempt in range(YfConfig.network.retries + 1):
             try:

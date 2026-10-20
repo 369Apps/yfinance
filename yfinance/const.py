@@ -1,6 +1,8 @@
 _QUERY1_URL_ = 'https://query1.finance.yahoo.com'
 _BASE_URL_ = 'https://query2.finance.yahoo.com'
 _ROOT_URL_ = 'https://finance.yahoo.com'
+# Quote-page news. Yahoo's /xhr/ncp route now 404s; the page reads this gateway.
+_NEWS_URL_ = 'https://nexus-gateway-prod.media.yahoo.com/'
 
 _SENTINEL_ = object()
 
